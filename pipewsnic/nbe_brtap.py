@@ -8,17 +8,18 @@
 
 import os, logging, collections
 
-from wsnic import NetworkBackend, Pollable, Exec, mac2str, random_private_mac
-from wsnic.dnsmasq import Dnsmasq
-from wsnic.iperf import IperfServer
-from wsnic.tuntap import open_tap
+from . import NetworkBackend, Pollable, Exec, mac2str, random_private_mac
+from .dnsmasq import Dnsmasq
+from .iperf import IperfServer
+from .tuntap import open_tap
 
 logger = logging.getLogger('brtap')
 
 class BridgedTapNetworkBackend(NetworkBackend):
-    def __init__(self, server):
+    def __init__(self, server, group_config):
         super().__init__(server)
-        self.br_iface = 'wsbr0'
+        self.config = group_config
+        self.br_iface = self.config.br_iface
         self.dhcp_server = None
         self.iperf_server = None
         self.is_opened = False
@@ -44,6 +45,9 @@ class BridgedTapNetworkBackend(NetworkBackend):
         if self.is_opened:
             return
         self.is_opened = True
+        ## destroy bridge if it already exists (cleanup from previous run)
+        Exec(logger, check=False)(f'ip link del dev {self.br_iface}')
+
         logger.info(f'creating bridge {self.br_iface}')
         ## create bridge with manually fixed MAC address, see https://superuser.com/a/1725894
         run = Exec(logger, check=True)
@@ -54,7 +58,7 @@ class BridgedTapNetworkBackend(NetworkBackend):
         self._install_nat_rules(True)
         ## install DHCP server on bridge interface
         if not self.config.disable_dhcp:
-            self.dhcp_server = Dnsmasq(self.server)
+            self.dhcp_server = Dnsmasq(self.server, self.config)
             self.dhcp_server.open(self.br_iface)
         if self.config.enable_iperf:
             self.iperf_server = IperfServer(self.server)
@@ -77,9 +81,10 @@ class BridgedTapNetworkBackend(NetworkBackend):
     def attach_ws_client(self, ws_client):
         ## Create a new BridgedTapDevice tap_device and link it and the
         ## given newly accepted WebSocketClient ws_client to each other:
-        ## - ws_client.nbe_data points to tap_device
+        ## ws_client.nbe_data points to tap_device
         ## - tap_device.ws_client points to ws_client
-        tap_device = BridgedTapDevice(self.server, ws_client)
+        ws_client.netbe = self
+        tap_device = BridgedTapDevice(self.server, ws_client, self)
         tap_device.open()
         ws_client.nbe_data = tap_device
 
@@ -92,12 +97,14 @@ class BridgedTapNetworkBackend(NetworkBackend):
         ws_client.nbe_data.send_frame(frame_pbuf)
 
 class BridgedTapDevice(Pollable):
-    def __init__(self, server, ws_client):
+    def __init__(self, server, ws_client, netbe):
         super().__init__(server)
+        self.netbe = netbe
+        self.config = netbe.config
         self.ws_client = ws_client            ## WebSocketClient, the ws_client associated to this TAP device
         self.buffer_pool = server.buffer_pool ## BufferPool, shared pool of buffers
         self.outq_pbuf = collections.deque()  ## bytes-like objects queued for sending to TAP device, possibly originating from buffer_pool
-        self.br_iface = server.netbe.br_iface ## the bridge's interface name, for example 'wsbr0'
+        self.br_iface = netbe.br_iface        ## the bridge's interface name, for example 'wsbr0'
         self.tap_fd = None                    ## int, TAP device file descriptor
         self.tap_iface = None                 ## string, TAP device name (for example: wstap0)
 

@@ -151,7 +151,7 @@ class Pollable:
     def __init__(self, server, epoll_flags=EPOLLIN):
         self.server = server
         self.config = server.config
-        self.netbe = server.netbe
+        self.netbe = getattr(server, 'netbe', None)
         self.epoll = server.epoll
         self.epoll_flags = epoll_flags
         self.fd = None

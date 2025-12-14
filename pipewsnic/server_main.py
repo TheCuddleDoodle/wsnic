@@ -5,35 +5,18 @@
 
 import os, re, logging, configparser, argparse, textwrap, time, ipaddress, select, shutil, subprocess
 
-from wsnic import BufferPool
-from wsnic.websock import WebSocketServer
-from wsnic.stunnel import StunnelProxyServer
+from . import BufferPool
+from .websock import WebSocketServer
+from .stunnel import StunnelProxyServer
 
-from wsnic.nbe_brtap import BridgedTapNetworkBackend
+from .nbe_brtap import BridgedTapNetworkBackend
 
 logger = logging.getLogger('wsnic')
 
-class WsnicConfig:
-    def __init__(self, args):
-        def parse_option(opt_name, opt_value):
-            if opt_name in ['dhcp_nameserver']:
-                return re.split(r'[,:;\s]+', opt_value)
-            elif opt_name in ['ws_port', 'wss_port', 'dhcp_lease_time']:
-                return int(opt_value)
-            elif opt_name in ['enable_inet', 'disable_dhcp', 'enable_iperf']:
-                return opt_value.lower() in ['yes', 'true', 't', '1']
-            elif opt_value == '':
-                return None
-            else:
-                return opt_value
-
-        ## declare options that can be modified by CLI or configuraton file
-        self.ws_address = None          ## str, WebSocket (Secure) TCP server bind address
-        self.ws_port = 8086             ## int, WebSocket TCP server port (ws://)
-        self.wss_port = 8087            ## int, WebSocket Secure TCP server port (wss://)
-        self.wss_certificate = None     ## str, PEM encoded certificate file, enables WebSocket Secure if defined
-        self.wss_private_key = None     ## str, PEM encoded private key file, optional
+class WsnicGroupConfig:
+    def __init__(self, parser=None, section=None, defaults=None):
         self.subnet = '192.168.86.0/24' ## str, defines bridge, gateway and DHCP server IP, and the DHCP pool
+        self.br_iface = 'wsbr0'         ## str, bridge interface name
         self.enable_inet = False        ## bool, True: use NAT masquerading to connect bridge to inet_iface
         self.inet_iface = None          ## str, name of an interface that provides Internet access
         self.disable_dhcp = False       ## bool, True: disable DHCP, False: use dnsmasq for DHCP/DNS
@@ -42,6 +25,64 @@ class WsnicConfig:
         self.dhcp_domain_name = None    ## str, local domain name published in DHCP replies
         self.dhcp_nameserver = None     ## array(str), list of DNS server IPs
         self.enable_iperf = False       ## bool, True: run iperf server for clients
+
+        if defaults:
+            self.copy_from(defaults)
+
+        if parser and section:
+            self.parse_config(parser, section)
+
+        self.derive_network_settings()
+
+    def copy_from(self, other):
+        for key, value in other.__dict__.items():
+            if not key.startswith('_') and not callable(value):
+                setattr(self, key, value)
+
+    def parse_option(self, opt_name, opt_value):
+        if opt_name in ['dhcp_nameserver']:
+            return re.split(r'[,:;\s]+', opt_value)
+        elif opt_name in ['ws_port', 'wss_port', 'dhcp_lease_time']:
+            return int(opt_value)
+        elif opt_name in ['disable_dhcp', 'enable_iperf']:
+            return opt_value.lower() in ['yes', 'true', 't', '1']
+        elif opt_value == '':
+            return None
+        else:
+            return opt_value
+
+    def parse_config(self, parser, section):
+        for opt_name, opt_value in parser.items(section):
+            if hasattr(self, opt_name):
+                setattr(self, opt_name, self.parse_option(opt_name, opt_value))
+            else:
+                logger.warning(f'section [{section}]: unknown option "{opt_name}" ignored!')
+
+    def derive_network_settings(self):
+        ## derive network settings dynamically from self.subnet
+        ip_subnet = ipaddress.ip_network(self.subnet)
+        hosts = ip_subnet.hosts()
+        self.server_addr = str(next(hosts))
+        self.host_addrs = [str(addr) for addr in hosts]
+        self.broadcast_addr = str(ip_subnet.broadcast_address)
+        self.netmask = str(ip_subnet.netmask)
+
+        ## set dhcp_nameserver default
+        if not self.disable_dhcp and not self.dhcp_nameserver:
+            self.dhcp_nameserver = [self.server_addr]
+
+
+class WsnicConfig:
+    def __init__(self, args):
+        ## declare options that can be modified by CLI or configuraton file
+        self.ws_address = None          ## str, WebSocket (Secure) TCP server bind address
+        self.ws_port = 8086             ## int, WebSocket TCP server port (ws://)
+        self.wss_port = 8087            ## int, WebSocket Secure TCP server port (wss://)
+        self.wss_certificate = None     ## str, PEM encoded certificate file, enables WebSocket Secure if defined
+        self.wss_private_key = None     ## str, PEM encoded private key file, optional
+
+        self.default_group = WsnicGroupConfig()
+        self.groups = {}                ## dict(str path => WsnicGroupConfig)
 
         ## check for Docker: Docker creates "/.dockerenv", podman "/run/.containerenv"
         is_docker_env = os.path.isfile('/.dockerenv') or os.path.isfile('/run/.containerenv')
@@ -55,17 +96,36 @@ class WsnicConfig:
             with open(wsnic_conf) as f_in:
                 conf_file = f_in.read()
             parser = configparser.ConfigParser(strict=True)
-            parser.read_string('[main]\n' + conf_file)
-            for opt_name, opt_value in parser.items('main'):
-                if hasattr(self, opt_name):
-                    setattr(self, opt_name, parse_option(opt_name, opt_value))
-                else:
-                    logger.warning(f'{wsnic_conf}: unknown option "{opt_name}" ignored!')
+            if not conf_file.lstrip().startswith('['):
+                conf_file = '[main]\n' + conf_file
+            parser.read_string(conf_file)
+
+            ## parse [main] section
+            if parser.has_section('main'):
+                 for opt_name, opt_value in parser.items('main'):
+                    if hasattr(self, opt_name):
+                        setattr(self, opt_name, self.default_group.parse_option(opt_name, opt_value))
+                    elif hasattr(self.default_group, opt_name):
+                        setattr(self.default_group, opt_name, self.default_group.parse_option(opt_name, opt_value))
+                    else:
+                        logger.warning(f'{wsnic_conf}: unknown option "{opt_name}" ignored!')
+
+            ## parse [group:...] sections
+            for section in parser.sections():
+                if section.startswith('group:'):
+                    path = section[6:]
+                    if not path.startswith('/'):
+                        path = '/' + path
+                    logger.info(f'found configuration for group "{path}"')
+                    self.groups[path] = WsnicGroupConfig(parser, section, defaults=self.default_group)
 
         ## parse and apply command line arguments next
         for opt_name, opt_value in args.__dict__.items():
-            if opt_value is not None and hasattr(self, opt_name):
-                setattr(self, opt_name, parse_option(opt_name, opt_value))
+            if opt_value is not None:
+                if hasattr(self, opt_name):
+                    setattr(self, opt_name, self.default_group.parse_option(opt_name, opt_value))
+                elif hasattr(self.default_group, opt_name):
+                    setattr(self.default_group, opt_name, self.default_group.parse_option(opt_name, opt_value))
 
         ## set defaults last
         if self.ws_address is None:
@@ -73,42 +133,37 @@ class WsnicConfig:
                 self.ws_address = '0.0.0.0'
             else:
                 self.ws_address = '127.0.0.1'
-        if self.enable_inet and self.inet_iface is None:
-            inet_iface = subprocess.getoutput('ip route | grep "^default " | grep -Po "(?<=dev )[^ ]+"')
-            if inet_iface:
-                self.inet_iface = inet_iface
+
+        ## self.default_group.enable_inet is effectively disabled because we removed the flag parsing or forced it off.
+        self.default_group.enable_inet = False
+        self.default_group.inet_iface = None
+        ## if self.default_group.enable_inet and self.default_group.inet_iface is None:
+        ##    inet_iface = subprocess.getoutput('ip route | grep "^default " | grep -Po "(?<=dev )[^ ]+"')
+        ##    if inet_iface:
+        ##        self.default_group.inet_iface = inet_iface
+        
         if self.wss_certificate is None and os.path.isfile('cert/cert.crt'):
             self.wss_certificate = os.path.abspath('cert/cert.crt')
         if self.wss_private_key is None and os.path.isfile('cert/cert.key'):
             self.wss_private_key = os.path.abspath('cert/cert.key')
 
-        ## derive network settings dynamically from self.subnet
-        ip_subnet = ipaddress.ip_network(self.subnet)
-        hosts = ip_subnet.hosts()
-        server_addr = str(next(hosts))
-        host_addrs = [str(addr) for addr in hosts]
-        broadcast_addr = str(ip_subnet.broadcast_address)
-        netmask = str(ip_subnet.netmask)
+        self.default_group.derive_network_settings()
 
-        ## set dhcp_nameserver default
-        if not self.disable_dhcp and not self.dhcp_nameserver:
-            self.dhcp_nameserver = [server_addr]
+        ## dynamic allocation state
+        self.next_dynamic_subnet_idx = 100
 
         if logger.isEnabledFor(logging.DEBUG):
             options = [f'{opt_name} = {opt_value}' for opt_name, opt_value in self.__dict__.items()]
             logger.debug('wsnic configuration:\n' + '\n'.join(options))
 
         self.is_docker_env = is_docker_env   ## bool, True: running under Docker or Docker-like environment
-        self.server_addr = server_addr       ## str, network's bridge, gateway and DHCP server IP address
-        self.host_addrs = host_addrs         ## array(str), network's DHCP host IP address pool
-        self.broadcast_addr = broadcast_addr ## str, network's broadcast IP address
-        self.netmask = netmask               ## str, network's netmask (in IP-notation)
+
 
 class WsnicServer:
     def __init__(self, config, netbe_class):
         self.config = config            ## WsnicConfig
         self.netbe_class = netbe_class  ## NetworkBackend class
-        self.netbe = None               ## NetworkBackend, instance of netbe_class created in run()
+        self.netbes = {}                ## dict(str path => NetworkBackend), created in run()
         self.ws_server = None           ## WebSocketServer, created in run()
         self.stunnel = None             ## StunnelProxyServer, created in run()
         self.buffer_pool = BufferPool() ## BufferPool, shared pool of buffers
@@ -131,11 +186,24 @@ class WsnicServer:
                 del self.pollables[fd]
 
     def run(self):
-        self.netbe = self.netbe_class(self)
-        self.netbe.open()
+        ## initialize default backend
+        ## default_netbe = self.netbe_class(self, self.config.default_group)
+        ## default_netbe.open()
+        ## self.netbes['/'] = default_netbe
+        
+        if self.config.groups:
+             for path, group_config in self.config.groups.items():
+                netbe = self.netbe_class(self, group_config)
+                netbe.open()
+                self.netbes[path] = netbe
 
+
+
+        print("Initializing WebSocketServer")
         self.ws_server = WebSocketServer(self)
+        print("Opening WebSocketServer")
         self.ws_server.open()
+        print("WebSocketServer opened")
 
         if self.config.wss_certificate:
             self.stunnel = StunnelProxyServer(self.config)
@@ -143,10 +211,15 @@ class WsnicServer:
 
         last_refresh_tm = time.time()
         terminated = False
+        terminated = False
+        print("Starting server loop")
         while not terminated:
+            # print("Polling...")
             poll_events = self.epoll.poll(2)    ## blocking wait for up to 2 seconds
+            # print(f"Poll returned {len(poll_events)} events")
             tm_now = time.time()
             for fd, ev in poll_events:
+                # print(f"Event on fd {fd}: {ev}")
                 pollable = self.pollables.get(fd, None)
                 if not pollable:
                     continue
@@ -157,6 +230,7 @@ class WsnicServer:
                 if ev & select.EPOLLHUP:
                     if pollable == self.ws_server:
                         logger.error('received unexpected hangup from WebSocket server socket, terminating')
+                        print("Terminating due to WS server HUP")
                         terminated = True
                         break
                     else:
@@ -171,11 +245,43 @@ class WsnicServer:
         if self.ws_server:
             self.ws_server.close('server shutdown')
             self.ws_server = None
-        if self.netbe:
-            self.netbe.close()
-            self.netbe = None
+        for netbe in self.netbes.values():
+            netbe.close()
+        self.netbes = {}
         self.epoll.close()
         self.buffer_pool.log_statistics(logger)
+
+    def get_or_create_group(self, path):
+        if path == '/':
+            return None
+        
+        if path in self.netbes:
+            return self.netbes[path]
+            
+        ## create new dynamic group
+        logger.info(f'creating dynamic group for path {path}')
+        
+        ## clone default config as base
+        group_config = WsnicGroupConfig()
+        group_config.copy_from(self.config.default_group)
+        
+        ## allocate new subnet and bridge
+        idx = self.config.next_dynamic_subnet_idx
+        self.config.next_dynamic_subnet_idx += 1
+        
+        group_config.subnet = f'192.168.{idx}.0/24'
+        group_config.br_iface = f'wsbr{idx}'
+        group_config.derive_network_settings()
+        
+        ## instantiate and open backend
+        netbe = self.netbe_class(self, group_config)
+        try:
+            netbe.open()
+            self.netbes[path] = netbe
+            return netbe
+        except Exception as e:
+            logger.error(f'failed to create dynamic group for {path}: {e}')
+            return None
 
 def main():
     def format_help(text):
@@ -285,13 +391,13 @@ def main():
     elif shutil.which('iptables') is None:
         print(f'error: executable file "iptables" not found (Debian: install apt package iptables)')
         return
-    elif not config.disable_dhcp and shutil.which('dnsmasq') is None:
+    elif not config.default_group.disable_dhcp and shutil.which('dnsmasq') is None:
         print(f'error: executable file "dnsmasq" not found (Debian: install apt package dnsmasq)')
         return
-    elif config.enable_iperf and shutil.which('iperf') is None:
+    elif config.default_group.enable_iperf and shutil.which('iperf') is None:
         print(f'error: executable file "iperf" not found (Debian: install apt package iperf)')
         return
-    elif config.enable_inet and not config.inet_iface:
+    elif config.default_group.enable_inet and not config.default_group.inet_iface:
         print(f'error: network interface must be specified, see CLI option "-f"')
         return
     elif config.wss_certificate and not os.path.isfile(config.wss_certificate):
@@ -305,6 +411,14 @@ def main():
     try:
         server.run()
     except KeyboardInterrupt:
-        print()
+        print("Caught KeyboardInterrupt")
+    except Exception as e:
+        print(f"Caught Exception: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
+        print("Entering finally block")
         server.shutdown()
+
+if __name__ == '__main__':
+    main()

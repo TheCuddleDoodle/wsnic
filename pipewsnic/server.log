@@ -1,0 +1,34 @@
+nohup: ignoring input
+11:32:43 INFO wsnic: reading wsnic configuration from test_groups.conf
+11:32:43 INFO wsnic: found configuration for group "/alpha"
+11:32:43 INFO wsnic: found configuration for group "/beta"
+11:32:43 DEBUG wsnic: wsnic configuration:
+ws_address = 127.0.0.1
+ws_port = 8086
+wss_port = 8087
+wss_certificate = None
+wss_private_key = None
+default_group = <__main__.WsnicGroupConfig object at 0x73dec63fbe80>
+groups = {'/alpha': <__main__.WsnicGroupConfig object at 0x73dec62241f0>, '/beta': <__main__.WsnicGroupConfig object at 0x73dec62241c0>}
+next_dynamic_subnet_idx = 100
+11:32:43 DEBUG brtap: $ ip link del dev wsbr1
+Cannot find device "wsbr1"
+11:32:43 INFO brtap: creating bridge wsbr1
+11:32:43 DEBUG brtap: $ ip link add dev wsbr1 address 12:82:0d:dc:35:f3 type bridge
+11:32:43 DEBUG brtap: $ ip addr add dev wsbr1 192.168.201.1/255.255.255.0 brd +
+11:32:43 DEBUG brtap: $ ip link set dev wsbr1 up
+11:32:43 INFO dnsmasq: 192.168.201.1: starting DHCP/DNS child process dnsmasq: dnsmasq --keep-in-foreground --no-ping --no-hosts --interface=wsbr1 --except-interface=lo --listen-address=192.168.201.1 --bind-interfaces --dhcp-range=192.168.201.2,192.168.201.254,255.255.255.0,86400s --dhcp-option=6,192.168.86.1 --dhcp-sequential-ip --dhcp-leasefile=/tmp/tmpcq05aryv
+11:32:43 DEBUG brtap: $ ip link del dev wsbr2
+Cannot find device "wsbr2"
+11:32:43 INFO brtap: creating bridge wsbr2
+11:32:43 DEBUG brtap: $ ip link add dev wsbr2 address e6:5f:3f:d4:34:7a type bridge
+11:32:43 DEBUG brtap: $ ip addr add dev wsbr2 192.168.202.1/255.255.255.0 brd +
+11:32:43 DEBUG brtap: $ ip link set dev wsbr2 up
+11:32:43 INFO dnsmasq: 192.168.202.1: starting DHCP/DNS child process dnsmasq: dnsmasq --keep-in-foreground --no-ping --no-hosts --interface=wsbr2 --except-interface=lo --listen-address=192.168.202.1 --bind-interfaces --dhcp-range=192.168.202.2,192.168.202.254,255.255.255.0,86400s --dhcp-option=6,192.168.86.1 --dhcp-sequential-ip --dhcp-leasefile=/tmp/tmp3k8js2b_
+11:32:43 INFO dnsmasq: child process dnsmasq terminated
+11:32:43 DEBUG brtap: $ ip link del wsbr1
+11:32:43 INFO brtap: destroyed bridge wsbr1
+11:32:43 INFO dnsmasq: child process dnsmasq terminated
+11:32:43 DEBUG brtap: $ ip link del wsbr2
+11:32:43 INFO brtap: destroyed bridge wsbr2
+11:32:43 INFO wsnic: buffer pool usage peaked at 0/32 buffers

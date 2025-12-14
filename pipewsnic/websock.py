@@ -5,7 +5,7 @@
 
 import logging, collections, socket, time, struct, base64, hashlib
 
-from wsnic import Pollable, MAX_PAYLOAD_SIZE
+from . import Pollable, MAX_PAYLOAD_SIZE
 
 logger = logging.getLogger('websock')
 
@@ -41,7 +41,7 @@ class HttpHandshakeDecoder:
         header_stop_ofs = self.request_buffer.find(b'\r\n\r\n')
         if header_stop_ofs < 0:
             return
-        handshake_key = self._parse_handshake_request(self.request_buffer, header_stop_ofs)
+        path, handshake_key = self._parse_handshake_request(self.request_buffer, header_stop_ofs)
         if not handshake_key:
             self.ws_client.refuse_http_handshake()
             self.request_buffer.clear()
@@ -49,7 +49,7 @@ class HttpHandshakeDecoder:
         raw_websocket_accept  = handshake_key + WS_MAGIC_UUID
         sha1_websocket_accept = hashlib.sha1(raw_websocket_accept).digest()
         sec_websocket_accept  = base64.b64encode(sha1_websocket_accept)
-        self.ws_client.accept_http_handshake(sec_websocket_accept, memoryview(self.request_buffer)[ header_stop_ofs + 4 : ])
+        self.ws_client.accept_http_handshake(sec_websocket_accept, memoryview(self.request_buffer)[ header_stop_ofs + 4 : ], path)
 
     def cleanup(self):
         pass
@@ -57,16 +57,18 @@ class HttpHandshakeDecoder:
     def _parse_handshake_request(self, data, data_len):
         hs_upgrade_websocket = False    ## True if header "Upgrade: websocket\r\n" exists
         handshake_key = None            ## bytes value of header "Sec-WebSocket-Key"
+        path = b'/'                     ## request path
 
         ## parse HTTP request start line, for example "GET / HTTP/1.1\r\n"
         eol_ofs = data.find(b'\r\n', 0, data_len)
         if eol_ofs < 0:
             logger.debug(f'{self.ws_client.addr}: request dropped, reason: missing HTTP request start line')
-            return None
+            return None, None
         start_line_fields = data[ : eol_ofs].split(b' ')
         if len(start_line_fields) != 3 or start_line_fields[0].upper() != b'GET':
             logger.debug(f'{self.ws_client.addr}: request dropped, reason: malformed HTTP request start line')
-            return None
+            return None, None
+        path = start_line_fields[1].split(b'?')[0]
         cursor = eol_ofs + 2
 
         ## parse HTTP request header
@@ -93,9 +95,9 @@ class HttpHandshakeDecoder:
             cursor = eol_ofs + 2
 
         if hs_upgrade_websocket and handshake_key is not None:
-            return handshake_key
+            return path, handshake_key
         else:
-            return None
+            return None, None
 
 class WsMessageDecoder:
     def __init__(self, ws_client):
@@ -286,7 +288,8 @@ class WebSocketClient(Pollable):
 
     def close(self, reason='unknown'):
         super().close()
-        self.netbe.detach_ws_client(self)
+        if self.netbe:
+            self.netbe.detach_ws_client(self)
         self.ws_server.remove_client(self)
         if self.sock is not None:
             self._clear_out()
@@ -314,7 +317,7 @@ class WebSocketClient(Pollable):
         self.wants_send(True)
         logger.info(f'{self.addr}: WebSocket client connection refused')
 
-    def accept_http_handshake(self, sec_websocket_accept, ws_bytes):
+    def accept_http_handshake(self, sec_websocket_accept, ws_bytes, path):
         ## called by HttpHandshakeDecoder.decode()
         ## send HTTP accept WebSocket handshake response
         self.outq_pbuf.append(b'\r\n'.join([
@@ -324,6 +327,17 @@ class WebSocketClient(Pollable):
             b'Sec-WebSocket-Accept: ' + sec_websocket_accept,
             b'', b'' ]))
         self.wants_send(True)
+        ## select network backend based on path
+        path_str = path.decode('utf-8', errors='ignore')
+        
+        ## try to get or create a dynamic group
+        self.netbe = self.ws_server.server.get_or_create_group(path_str)
+        
+        if self.netbe is None:
+            logger.error(f'{self.addr}: no backend found or created for path {path_str}, closing')
+            self.close('no backend found')
+            return
+
         ## accept WebSocket connection
         self.netbe.attach_ws_client(self)
         logger.info(f'{self.addr}: accepted WebSocket client connection')

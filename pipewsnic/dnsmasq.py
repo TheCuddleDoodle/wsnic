@@ -8,9 +8,9 @@ import logging, os, shutil, tempfile, subprocess
 logger = logging.getLogger('dnsmasq')
 
 class Dnsmasq:
-    def __init__(self, server):
+    def __init__(self, server, config):
         self.server = server
-        self.config = server.config
+        self.config = config
         self.lease_file = None
         self.dnsmasq_p = None
 
